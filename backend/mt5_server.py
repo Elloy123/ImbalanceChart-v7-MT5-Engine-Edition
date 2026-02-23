@@ -557,7 +557,7 @@ async def simulation_loop():
 # ==========================================
 # HTTP SERVER (serves frontend)
 # ==========================================
-def start_http_server(port=8000):
+def start_http_server(port=8001):
     base = os.path.dirname(os.path.abspath(__file__))
     
     for candidate in [
@@ -620,10 +620,10 @@ async def main():
     http_thread.start()
     
     # Start WebSocket server
-    print(f"📡 WebSocket: ws://localhost:8765")
+    print(f"📡 WebSocket: ws://localhost:8766")
     print("=" * 60 + "\n")
     
-    server = await websockets.serve(handle_client, "localhost", 8765)
+    server = await websockets.serve(handle_client, "localhost", 8766)
     
     # Start background tasks
     mt5_task = asyncio.create_task(mt5_poll_loop())
