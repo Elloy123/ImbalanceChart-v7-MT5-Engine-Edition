@@ -36,6 +36,7 @@ except ImportError:
     sys.exit(1)
 
 from engine_orchestrator import VolumeEngineOrchestrator, SYMBOL_ENGINE_CONFIG
+from liquidity_break import rebuild_clusters_from_ticks, detect_liquidity_breaks
 
 # ==========================================
 # LOGGING
@@ -284,6 +285,11 @@ active_symbols = ["BTCUSD", "XAUUSD", "EURUSD", "GBPUSD", "USTEC"]
 tick_count = 0
 weight_mode = 'price_weighted'
 
+# Per-symbol visible tick cache (populated on get_history responses)
+visible_tick_cache: Dict[str, List[Dict]] = {}
+# Per-symbol cluster configs set by the frontend slider
+cluster_configs: Dict[str, Dict] = {}
+
 DEFAULT_ENGINES = ["tick_velocity", "spread_weight", "micro_cluster", "atr_normalize", "imbalance_detector"]
 
 # ==========================================
@@ -345,6 +351,8 @@ async def handle_client(ws, path=None):
                     sym = data.get('symbol', current_symbol).upper()
                     hours = data.get('hours', 24)
                     ticks = mt5_conn.get_history(sym, hours)
+                    # Cache the visible tick universe for this symbol
+                    visible_tick_cache[sym] = ticks
                     await ws.send(json.dumps({
                         'type': 'history',
                         'symbol': sym,
@@ -352,6 +360,57 @@ async def handle_client(ws, path=None):
                         'hours': hours,
                         'ticks': ticks,
                     }))
+                
+                elif action == 'set_cluster_config':
+                    sym = data.get('symbol', current_symbol).upper()
+                    delta_th = data.get('delta_th')
+                    price_step = data.get('price_step')
+
+                    # Validate types (also rejects None from missing fields)
+                    if not isinstance(delta_th, (int, float)) or not isinstance(price_step, (int, float)):
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: delta_th and price_step must be numbers',
+                        }))
+                    elif delta_th <= 0:
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: delta_th must be > 0',
+                        }))
+                    elif price_step <= 0:
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: price_step must be > 0',
+                        }))
+                    else:
+                        cluster_configs[sym] = {'delta_th': delta_th, 'price_step': price_step}
+                        await broadcast({
+                            'type': 'cluster_config_updated',
+                            'symbol': sym,
+                            'delta_th': delta_th,
+                            'price_step': price_step,
+                        })
+                        logger.info(f"[CLUSTER] Config {sym}: delta_th={delta_th} price_step={price_step}")
+
+                        # Rebuild from cached visible ticks
+                        cached = visible_tick_cache.get(sym)
+                        if not cached:
+                            await ws.send(json.dumps({
+                                'type': 'error',
+                                'message': f'set_cluster_config: no cached ticks for {sym}; load history first',
+                            }))
+                        else:
+                            closed = rebuild_clusters_from_ticks(cached, sym, delta_th, price_step)
+                            lb_list = detect_liquidity_breaks(closed)
+                            await broadcast({
+                                'type': 'liquidity_breaks',
+                                'symbol': sym,
+                                'delta_th': delta_th,
+                                'price_step': price_step,
+                                'count': len(lb_list),
+                                'breaks': lb_list,
+                            })
+                            logger.info(f"[CLUSTER] {sym}: {len(closed)} clusters, {len(lb_list)} breaks")
                 
                 elif action == 'set_weight_mode':
                     mode = data.get('mode', 'price_weighted')
