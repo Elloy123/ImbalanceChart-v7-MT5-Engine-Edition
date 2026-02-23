@@ -22,6 +22,12 @@ import threading
 # MT5 DETECTION
 # ==========================================
 try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+except ImportError:
+    pass  # python-dotenv optional; fall back to environment variables already set
+
+try:
     import MetaTrader5 as mt5
     MT5_AVAILABLE = True
     print("✅ Biblioteca MetaTrader5 disponível")
@@ -64,13 +70,18 @@ def gcfg(symbol):
     return SYM_CFG.get(symbol.upper(), {'dig': 5, 'base': 1.0, 'mult': 1000.0, 'bv': 5.0, 'delta_th': 500, 'step': 0.0001})
 
 # ==========================================
-# MT5 CREDENTIALS — CONFIGURE AQUI
+# MT5 CREDENTIALS — set via environment variables or backend/.env
 # ==========================================
+_mt5_login_str = os.environ.get("MT5_LOGIN", "")
+try:
+    _mt5_login = int(_mt5_login_str.strip()) if _mt5_login_str.strip() else None
+except ValueError:
+    _mt5_login = None
 MT5_CONFIG = {
-    "login": 65261682,
-    "password": "Fcom4040#",
-    "server": "Exness-MT5Real11",
-    "timeout": 60000,
+    "login": _mt5_login,
+    "password": os.environ.get("MT5_PASSWORD", ""),
+    "server": os.environ.get("MT5_SERVER", ""),
+    "timeout": int(os.environ.get("MT5_TIMEOUT", "60000")),
 }
 
 # ==========================================
@@ -161,12 +172,21 @@ class MT5Connector:
         logger.info("🔌 Conectando ao MT5...")
         
         try:
-            if not mt5.initialize(
-                login=MT5_CONFIG["login"],
-                password=MT5_CONFIG["password"],
-                server=MT5_CONFIG["server"],
-                timeout=MT5_CONFIG["timeout"],
-            ):
+            has_creds = bool(
+                MT5_CONFIG.get("login") is not None and
+                MT5_CONFIG.get("password") and
+                MT5_CONFIG.get("server")
+            )
+            if has_creds:
+                ok = mt5.initialize(
+                    login=MT5_CONFIG["login"],
+                    password=MT5_CONFIG["password"],
+                    server=MT5_CONFIG["server"],
+                    timeout=MT5_CONFIG["timeout"],
+                )
+            else:
+                ok = False
+            if not ok:
                 # Try without credentials (MT5 already open)
                 if not mt5.initialize():
                     logger.error(f"❌ Falha: {mt5.last_error()}")
@@ -286,6 +306,16 @@ weight_mode = 'price_weighted'
 
 DEFAULT_ENGINES = ["tick_velocity", "spread_weight", "micro_cluster", "atr_normalize", "imbalance_detector"]
 
+# Allowlisted engine parameters that may be tuned at runtime via set_engine_config
+_ENGINE_ALLOWLIST = frozenset({
+    'price_step', 'imbalance_ratio', 'window_trades', 'min_stacking',
+    'weight_mode', 'window', 'window_sec', 'window_ms',
+    'burst_threshold', 'baseline_decay',
+    'min_trades', 'dominance_ratio', 'vol_threshold_pct',
+    'low_vol', 'high_vol',
+    'candle_period_sec', 'atr_periods',
+})
+
 # ==========================================
 # WEBSOCKET SERVER
 # ==========================================
@@ -319,6 +349,17 @@ async def handle_client(ws, path=None):
         }
     }))
     
+    # Send engine config snapshot so frontend sliders can sync
+    if orchestrator:
+        engine_snapshot = {}
+        for name, engine in orchestrator.engines.items():
+            params = {}
+            for attr in _ENGINE_ALLOWLIST:
+                if hasattr(engine, attr):
+                    params[attr] = getattr(engine, attr)
+            engine_snapshot[name] = params
+        await ws.send(json.dumps({'type': 'engine_config', 'engines': engine_snapshot}))
+    
     try:
         async for msg in ws:
             try:
@@ -331,7 +372,7 @@ async def handle_client(ws, path=None):
                         current_symbol = sym
                         vc.reset(sym)
                         if orchestrator:
-                            orchestrator.switch_symbol(sym)
+                            orchestrator.switch_symbol(sym, price_step=gcfg(sym)['step'])
                         if mt5_conn.connected:
                             mt5_conn.enable_symbol(sym)
                         await ws.send(json.dumps({
@@ -366,6 +407,24 @@ async def handle_client(ws, path=None):
                         })
                         logger.info(f"⚖️ Weight mode: {mode}")
                 
+                elif action == 'set_engine_config':
+                    engine_name = data.get('engine', '')
+                    params = data.get('params', {})
+                    if orchestrator and engine_name in orchestrator.engines:
+                        engine = orchestrator.engines[engine_name]
+                        applied = {}
+                        for k, v in params.items():
+                            if k in _ENGINE_ALLOWLIST and hasattr(engine, k):
+                                setattr(engine, k, v)
+                                applied[k] = v
+                        if applied:
+                            await broadcast({
+                                'type': 'engine_config_updated',
+                                'engine': engine_name,
+                                'params': applied,
+                            })
+                            logger.info(f"⚙️ Engine {engine_name} config: {applied}")
+                
                 elif action in ('ping', 'pong'):
                     await ws.send(json.dumps({'type': 'pong'}))
                     
@@ -383,7 +442,7 @@ async def handle_client(ws, path=None):
 async def mt5_poll_loop():
     global tick_count, orchestrator
     
-    last_times = {s: 0 for s in active_symbols}
+    last_times_msc = {s: 0 for s in active_symbols}
     
     while True:
         if not mt5_conn.connected or not connected_clients:
@@ -394,42 +453,44 @@ async def mt5_poll_loop():
             sym = current_symbol
             tick = mt5_conn.get_tick(sym)
             
-            if tick and tick.time != last_times.get(sym, 0):
-                last_times[sym] = tick.time
-                tick_count += 1
-                
-                if tick.bid > 0 and tick.ask > 0:
-                    config = gcfg(sym)
-                    mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
+            if tick:
+                tick_msc = getattr(tick, 'time_msc', None) or (tick.time * 1000)
+                if tick_msc != last_times_msc.get(sym, 0):
+                    last_times_msc[sym] = tick_msc
+                    tick_count += 1
                     
-                    tick_data = {
-                        'symbol': sym,
-                        'price': round(mid, config['dig']),
-                        'bid': round(tick.bid, config['dig']),
-                        'ask': round(tick.ask, config['dig']),
-                        'volume_synthetic': round(vol, 2),
-                        'side': side,
-                        'timestamp': int(time.time() * 1000),
-                        'spread': round(spread, config['dig']),
-                        'price_change': round(pc, config['dig']),
-                    }
-                    
-                    # Run engines
-                    if orchestrator:
-                        analysis = orchestrator.analyze_tick(tick_data)
-                        tick_data['is_absorption'] = analysis.get('is_absorption', False)
-                        tick_data['absorption_type'] = analysis.get('absorption_type')
-                        tick_data['absorption_strength'] = analysis.get('absorption_strength', 0)
-                        tick_data['composite_signal'] = analysis.get('composite_signal', 0)
-                        tick_data['stacking_buy'] = analysis.get('stacking_buy', 0)
-                        tick_data['stacking_sell'] = analysis.get('stacking_sell', 0)
-                        tick_data['engines'] = analysis.get('engines', {})
-                    
-                    await broadcast({'type': 'tick', 'data': tick_data})
-                    
-                    if tick_count % 200 == 0:
-                        side_icon = '🟢' if side == 'buy' else '🔴'
-                        logger.info(f"{side_icon} #{tick_count} | {sym} {tick.bid:.{config['dig']}f}/{tick.ask:.{config['dig']}f} | vol={vol:.1f} | Δ={side}")
+                    if tick.bid > 0 and tick.ask > 0:
+                        config = gcfg(sym)
+                        mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
+                        
+                        tick_data = {
+                            'symbol': sym,
+                            'price': round(mid, config['dig']),
+                            'bid': round(tick.bid, config['dig']),
+                            'ask': round(tick.ask, config['dig']),
+                            'volume_synthetic': round(vol, 2),
+                            'side': side,
+                            'timestamp': tick_msc,
+                            'spread': round(spread, config['dig']),
+                            'price_change': round(pc, config['dig']),
+                        }
+                        
+                        # Run engines
+                        if orchestrator:
+                            analysis = orchestrator.analyze_tick(tick_data)
+                            tick_data['is_absorption'] = analysis.get('is_absorption', False)
+                            tick_data['absorption_type'] = analysis.get('absorption_type')
+                            tick_data['absorption_strength'] = analysis.get('absorption_strength', 0)
+                            tick_data['composite_signal'] = analysis.get('composite_signal', 0)
+                            tick_data['stacking_buy'] = analysis.get('stacking_buy', 0)
+                            tick_data['stacking_sell'] = analysis.get('stacking_sell', 0)
+                            tick_data['engines'] = analysis.get('engines', {})
+                        
+                        await broadcast({'type': 'tick', 'data': tick_data})
+                        
+                        if tick_count % 200 == 0:
+                            side_icon = '🟢' if side == 'buy' else '🔴'
+                            logger.info(f"{side_icon} #{tick_count} | {sym} {tick.bid:.{config['dig']}f}/{tick.ask:.{config['dig']}f} | vol={vol:.1f} | Δ={side}")
             
             await asyncio.sleep(0.03)  # ~33 polls/sec
             
@@ -539,6 +600,7 @@ async def main():
     orchestrator = VolumeEngineOrchestrator(
         engine_names=DEFAULT_ENGINES,
         symbol=current_symbol,
+        price_step=gcfg(current_symbol)['step'],
     )
     print(f"✅ Engines: {', '.join(DEFAULT_ENGINES)}")
     print(f"⚖️ Weight mode: {weight_mode}")

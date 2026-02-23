@@ -32,12 +32,13 @@ SYMBOL_ENGINE_CONFIG = {
 }
 
 class VolumeEngineOrchestrator:
-    def __init__(self, engine_names=None, config=None, symbol='EURUSD'):
+    def __init__(self, engine_names=None, config=None, symbol='EURUSD', price_step=None):
         self.config = config or {}
         self.symbol = symbol
         self.engines: Dict[str, VolumeEngine] = {}
         
         sym_cfg = SYMBOL_ENGINE_CONFIG.get(symbol.upper(), {'price_step': 0.0001})
+        effective_step = price_step if price_step is not None else sym_cfg['price_step']
         
         names = engine_names or list(ENGINE_REGISTRY.keys())
         for name in names:
@@ -45,7 +46,7 @@ class VolumeEngineOrchestrator:
                 eng_config = {**self.config.get(name, {})}
                 # Inject symbol-specific price_step for imbalance_detector
                 if name == 'imbalance_detector':
-                    eng_config.setdefault('price_step', sym_cfg['price_step'])
+                    eng_config.setdefault('price_step', effective_step)
                 self.engines[name] = ENGINE_REGISTRY[name](eng_config)
     
     def analyze_tick(self, tick: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,15 +98,16 @@ class VolumeEngineOrchestrator:
             'engines': results,
         }
     
-    def switch_symbol(self, symbol):
+    def switch_symbol(self, symbol, price_step=None):
         """Troca símbolo e reconfigura engines."""
         self.symbol = symbol.upper()
         sym_cfg = SYMBOL_ENGINE_CONFIG.get(self.symbol, {'price_step': 0.0001})
+        effective_step = price_step if price_step is not None else sym_cfg['price_step']
         
         for name, engine in self.engines.items():
             engine.reset()
             if name == 'imbalance_detector' and hasattr(engine, 'price_step'):
-                engine.price_step = sym_cfg['price_step']
+                engine.price_step = effective_step
     
     def set_weight_mode(self, mode):
         """Muda modo de ponderação nos engines que suportam."""
