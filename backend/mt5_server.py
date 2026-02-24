@@ -401,15 +401,15 @@ async def handle_client(ws, path=None):
                             }))
                         else:
                             closed = rebuild_clusters_from_ticks(cached, sym, delta_th, price_step)
-                            lb_list = detect_liquidity_breaks(closed)
+                            lb_list = detect_liquidity_breaks(closed, price_step=price_step, min_steps=2)
                             await broadcast({
-                                'type': 'liquidity_breaks',
-                                'symbol': sym,
-                                'delta_th': delta_th,
-                                'price_step': price_step,
-                                'count': len(lb_list),
-                                'breaks': lb_list,
-                            })
+                                        'type': 'clusters_closed',
+                                        'symbol': sym,
+                                        'delta_th': delta_th,
+                                        'price_step': price_step,
+                                        'count': len(closed),
+                                        'clusters': closed,
+                })
                             logger.info(f"[CLUSTER] {sym}: {len(closed)} clusters, {len(lb_list)} breaks")
                 
                 elif action == 'set_weight_mode':
@@ -453,25 +453,50 @@ async def mt5_poll_loop():
             sym = current_symbol
             tick = mt5_conn.get_tick(sym)
             
-            if tick and tick.time != last_times.get(sym, 0):
-                last_times[sym] = tick.time
-                tick_count += 1
-                
-                if tick.bid > 0 and tick.ask > 0:
-                    config = gcfg(sym)
-                    mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
-                    
-                    tick_data = {
-                        'symbol': sym,
-                        'price': round(mid, config['dig']),
-                        'bid': round(tick.bid, config['dig']),
-                        'ask': round(tick.ask, config['dig']),
-                        'volume_synthetic': round(vol, 2),
-                        'side': side,
-                        'timestamp': int(time.time() * 1000),
-                        'spread': round(spread, config['dig']),
-                        'price_change': round(pc, config['dig']),
-                    }
+             # Dedup with ms precision (prevents dropping multiple ticks per second)
+            if tick:
+                tick_ts = getattr(tick, "time_msc", None)
+                if tick_ts is None:
+                    # fallback: seconds -> ms
+                    tick_ts = int(getattr(tick, "time", 0)) * 1000
+
+                if tick_ts != last_times.get(sym, 0):
+                    last_times[sym] = tick_ts
+                    tick_count += 1
+
+                    if tick.bid > 0 and tick.ask > 0:
+                        config = gcfg(sym)
+                        mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
+
+                        tick_data = {
+                            'symbol': sym,
+                            'price': round(mid, config['dig']),
+                            'bid': round(tick.bid, config['dig']),
+                            'ask': round(tick.ask, config['dig']),
+                            'volume_synthetic': round(vol, 2),
+                            'side': side,
+                            # Use the actual MT5 tick timestamp (ms)
+                            'timestamp': int(tick_ts),
+                            'spread': round(spread, config['dig']),
+                            'price_change': round(pc, config['dig']),
+                        }
+
+                        # Run engines
+                        if orchestrator:
+                            analysis = orchestrator.analyze_tick(tick_data)
+                            tick_data['is_absorption'] = analysis.get('is_absorption', False)
+                            tick_data['absorption_type'] = analysis.get('absorption_type')
+                            tick_data['absorption_strength'] = analysis.get('absorption_strength', 0)
+                            tick_data['composite_signal'] = analysis.get('composite_signal', 0)
+                            tick_data['stacking_buy'] = analysis.get('stacking_buy', 0)
+                            tick_data['stacking_sell'] = analysis.get('stacking_sell', 0)
+                            tick_data['engines'] = analysis.get('engines', {})
+
+                        await broadcast({'type': 'tick', 'data': tick_data})
+
+                        if tick_count % 200 == 0:
+                            side_icon = '🟢' if side == 'buy' else '🔴'
+                            logger.info(f"{side_icon} #{tick_count} | {sym} {tick.bid:.{config['dig']}f}/{tick.ask:.{config['dig']}f} | vol={vol:.1f} | Δ={side}")
                     
                     # Run engines
                     if orchestrator:

@@ -1,9 +1,11 @@
-"""
-Cluster rebuild + Liquidity Break detection (backend-side).
+from __future__ import annotations
 
-Pure functions — unit-testable without any MT5 or WebSocket dependencies.
-"""
-from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional
+
+
+def _side_from_delta(delta: float) -> str:
+    return "BUY" if delta >= 0 else "SELL"
 
 
 def rebuild_clusters_from_ticks(
@@ -13,150 +15,191 @@ def rebuild_clusters_from_ticks(
     price_step: float,
 ) -> List[Dict[str, Any]]:
     """
-    Iterate *ticks* in time order and return a list of **closed** cluster dicts.
+    Rebuild closed clusters from tick history.
 
-    Parameters
-    ----------
-    ticks      : list of tick dicts containing at least:
-                 'price', 'volume_synthetic', 'side' ('buy'/'sell'), 'timestamp'
-    symbol     : instrument name (stored in each cluster snapshot)
-    delta_th   : absolute delta threshold; cluster closes when abs(delta) >= delta_th
-    price_step : price discretisation step (must be > 0)
+    Tick schema expected (at minimum):
+      - price: float
+      - side: "buy" | "sell"
+      - volume_synthetic: float (or fallback 1.0)
+      - timestamp: int (ms)
     """
+    if delta_th <= 0:
+        raise ValueError("delta_th must be > 0")
     if price_step <= 0:
         raise ValueError("price_step must be > 0")
 
     closed: List[Dict[str, Any]] = []
+    cid = 0
 
-    # Current open cluster state
-    delta: float = 0.0
-    vol_by_level: Dict[int, float] = {}   # level_index -> cumulative volume
-    ts_open: Optional[int] = None
-    price_open: Optional[float] = None
-    price_high: Optional[float] = None
-    price_low: Optional[float] = None
-    cluster_id: int = 0
+    # forming cluster state
+    delta = 0.0
+    vol_total = 0.0
+    open_p = high_p = low_p = close_p = None
+    ts_open = None
+    ts_close = None
+    level_vol: Dict[int, float] = {}
 
-    def _close_cluster(ts_close: int, price_close: float) -> Dict[str, Any]:
-        nonlocal cluster_id
-        cluster_id += 1
+    def close_cluster():
+        nonlocal cid, delta, vol_total, open_p, high_p, low_p, close_p, ts_open, ts_close, level_vol
 
-        # POC = level with maximum cumulative volume
-        if not vol_by_level:
-            poc = price_close
-        else:
-            poc_level = max(vol_by_level, key=lambda lvl: vol_by_level[lvl])
-            poc = poc_level * price_step
-        volume_total = sum(vol_by_level.values())
-        side = "BUY" if delta >= 0 else "SELL"
+        if open_p is None:
+            return
 
-        return {
-            "id": cluster_id,
+        # POC = level with highest volume
+        poc_level = max(level_vol.items(), key=lambda kv: kv[1])[0] if level_vol else int(round(open_p / price_step))
+        poc = poc_level * price_step
+
+        c = {
+            "id": cid,
             "symbol": symbol,
-            "side": side,
-            "poc": round(poc, 10),
-            "delta_final": round(delta, 4),
-            "volume_total": round(volume_total, 4),
-            "ts_open": ts_open,
-            "ts_close": ts_close,
-            "price_open": price_open,
-            "price_high": price_high,
-            "price_low": price_low,
-            "price_close": round(price_close, 10),
+            "side": _side_from_delta(delta),
+            "poc": float(poc),
+            "delta_final": float(delta),
+            "volume_total": float(vol_total),
+            "ts_open": int(ts_open) if ts_open is not None else None,
+            "ts_close": int(ts_close) if ts_close is not None else None,
+            "price_open": float(open_p),
+            "price_high": float(high_p),
+            "price_low": float(low_p),
+            "price_close": float(close_p),
         }
+        closed.append(c)
+        cid += 1
 
-    def _reset_open():
-        nonlocal delta, vol_by_level, ts_open, price_open, price_high, price_low
+        # reset forming
         delta = 0.0
-        vol_by_level = {}
+        vol_total = 0.0
+        open_p = high_p = low_p = close_p = None
         ts_open = None
-        price_open = None
-        price_high = None
-        price_low = None
+        ts_close = None
+        level_vol = {}
 
-    for tick in ticks:
+    for t in ticks:
         try:
-            price: float = float(tick["price"])
-            vol: float = float(tick["volume_synthetic"])
-            side: str = str(tick["side"]).lower()
-            ts: int = int(tick["timestamp"])
-        except (KeyError, TypeError, ValueError):
+            price = float(t["price"])
+        except Exception:
             continue
 
-        # Initialise open cluster on first valid tick
-        if ts_open is None:
-            ts_open = ts
-            price_open = price
-            price_high = price
-            price_low = price
+        side = (t.get("side") or "buy").lower()
+        vol = t.get("volume_synthetic")
+        if not isinstance(vol, (int, float)):
+            vol = 1.0
+        vol = float(vol)
 
-        # Accumulate delta
+        ts = t.get("timestamp")
+        try:
+            ts = int(ts) if ts is not None else None
+        except Exception:
+            ts = None
+
+        # discretize by integer level index to avoid float drift
+        level = int(round(price / price_step))
+        dp = level * price_step
+
+        if open_p is None:
+            open_p = dp
+            high_p = dp
+            low_p = dp
+            close_p = dp
+            ts_open = ts
+            ts_close = ts
+
+        # update OHLC
+        close_p = dp
+        high_p = max(high_p, dp)
+        low_p = min(low_p, dp)
+        ts_close = ts
+
+        # delta accumulation
         if side == "buy":
             delta += vol
         else:
             delta -= vol
 
-        # Discretise price to avoid float drift
-        level = int(round(price / price_step))
-        vol_by_level[level] = vol_by_level.get(level, 0.0) + vol
+        vol_total += vol
+        level_vol[level] = level_vol.get(level, 0.0) + vol
 
-        # Update OHLC for the open cluster
-        if price_high is None or price > price_high:
-            price_high = price
-        if price_low is None or price < price_low:
-            price_low = price
-
-        # Close cluster when threshold is crossed
+        # close condition
         if abs(delta) >= delta_th:
-            closed.append(_close_cluster(ts, price))
-            _reset_open()
+            close_cluster()
 
-    # Discard any partially-open cluster (user wants closed clusters only)
+    # ignore forming cluster for liquidity breaks (requirement: only closed clusters)
     return closed
 
 
 def detect_liquidity_breaks(
     closed_clusters: List[Dict[str, Any]],
+    *,
+    price_step: float,
+    min_steps: int = 2,
 ) -> List[Dict[str, Any]]:
     """
-    Scan *closed_clusters* in order and return a list of liquidity-break events.
+    Liquidity break detection (opposite-cluster only) + minimum displacement filter.
 
-    Logic (opposite-cluster only):
-    - BUY  cluster whose POC > last SELL cluster's POC  => SELLERS_REPRICED_HIGHER
-    - SELL cluster whose POC < last BUY  cluster's POC  => BUYERS_REPRICED_LOWER
+    BUY break: BUY.poc > last SELL.poc by at least min_steps*price_step
+    SELL break: SELL.poc < last BUY.poc by at least min_steps*price_step
     """
-    breaks: List[Dict[str, Any]] = []
+    if price_step <= 0:
+        raise ValueError("price_step must be > 0")
+    if min_steps < 1:
+        min_steps = 1
+
+    min_move = price_step * float(min_steps)
+
     last_buy: Optional[Dict[str, Any]] = None
     last_sell: Optional[Dict[str, Any]] = None
+    breaks: List[Dict[str, Any]] = []
 
-    for cluster in closed_clusters:
-        side = cluster.get("side", "")
-        poc = cluster.get("poc", 0.0)
+    for c in closed_clusters:
+        side = c.get("side")
+        poc = c.get("poc")
+        if poc is None or side not in ("BUY", "SELL"):
+            continue
+
+        poc = float(poc)
 
         if side == "BUY":
-            if last_sell is not None and poc > last_sell["poc"]:
-                breaks.append({
-                    "type": "SELLERS_REPRICED_HIGHER",
-                    "previousPOC": last_sell["poc"],
-                    "breakingPOC": poc,
-                    "delta": cluster["delta_final"],
-                    "breakingVolume": cluster["volume_total"],
-                    "time": cluster["ts_close"],
-                    "cluster_id": cluster["id"],
-                })
-            last_buy = cluster
+            if last_sell is not None:
+                prev = float(last_sell["poc"])
+                if (poc - prev) >= min_move:
+                    breaks.append({
+                        "type": "SELLERS_REPRICED_HIGHER",
+                        "previousPOC": prev,
+                        "breakingPOC": poc,
+                        "move": float(poc - prev),
+                        "min_move": float(min_move),
 
-        elif side == "SELL":
-            if last_buy is not None and poc < last_buy["poc"]:
-                breaks.append({
-                    "type": "BUYERS_REPRICED_LOWER",
-                    "previousPOC": last_buy["poc"],
-                    "breakingPOC": poc,
-                    "delta": cluster["delta_final"],
-                    "breakingVolume": cluster["volume_total"],
-                    "time": cluster["ts_close"],
-                    "cluster_id": cluster["id"],
-                })
-            last_sell = cluster
+                        # where it happened (for plotting)
+                        "cluster_id": c.get("id"),
+                        "time": c.get("ts_close"),
+
+                        # extra context
+                        "delta": c.get("delta_final"),
+                        "breakingVolume": c.get("volume_total"),
+                        "prev_cluster_id": last_sell.get("id"),
+                        "prev_time": last_sell.get("ts_close"),
+                    })
+            last_buy = c
+
+        else:  # SELL
+            if last_buy is not None:
+                prev = float(last_buy["poc"])
+                if (prev - poc) >= min_move:
+                    breaks.append({
+                        "type": "BUYERS_REPRICED_LOWER",
+                        "previousPOC": prev,
+                        "breakingPOC": poc,
+                        "move": float(prev - poc),
+                        "min_move": float(min_move),
+
+                        "cluster_id": c.get("id"),
+                        "time": c.get("ts_close"),
+
+                        "delta": c.get("delta_final"),
+                        "breakingVolume": c.get("volume_total"),
+                        "prev_cluster_id": last_buy.get("id"),
+                        "prev_time": last_buy.get("ts_close"),
+                    })
+            last_sell = c
 
     return breaks
