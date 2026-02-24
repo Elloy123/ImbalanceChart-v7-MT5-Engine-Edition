@@ -48,9 +48,9 @@ let CONFIG = {
   drawLineWidth: 1.5,
 };
 
-const WS_URL = 'ws://localhost:8765';
+const WS_URL = 'ws://localhost:8766';
 const PRICE_WIDTH = 80;
-const STEP_BASE = 0.50;          // << melhoria
+const STEP_BASE = 0.50;
 let HISTOGRAM_RATIO = 0.25;
 let HIST_SPLIT = 0.55;
 
@@ -58,6 +58,9 @@ let HIST_SPLIT = 0.55;
 let ws = null;
 let isLive = false;
 let clusters = [];
+let liquidityBreaks = [];
+let activeLiquidityLevels = [];
+let backendClosedClusters = [];
 let threshold = 100;
 let priceStep = 0.50;
 let viewMode = 'hybrid';
@@ -71,21 +74,23 @@ let dataSource = 'searching';
 let currentSymbol = 'XAUUSD';
 let weightMode = 'price_weighted';
 
-// Focus only 2 symbols
 const SYMBOLS = {
   'XAUUSD':  { label: 'XAU/USD', dig: 2, delta_th: 100, step: 0.50 },
   'USTEC':   { label: 'USTEC',   dig: 2, delta_th: 150, step: 0.50 },
 };
 
-// Closed clusters preserved
 let closedClusters = [];
 let formingCluster = null;
 let formingTicks = [];
-
-// Master ticks for full reprocess
 let masterTicks = [];
 
-// View state
+// ---------- MANUAL LB LABELING (training) ----------
+let manualLB = {
+  prev: null,
+  brk: null,
+  items: [],
+};
+
 let viewState = {
   offsetX: 0,
   offsetY: 0,
@@ -96,17 +101,13 @@ let viewState = {
   lastY: 0,
 };
 
-// Crosshair
 let crosshair = { x: 0, y: 0, visible: false };
-
-// Drawing tools
 let drawTool = 'none';
 let drawings = [];
 let currentDrawing = null;
 let selectedDrawing = null;
 let nextDrawId = 1;
 
-// Canvas
 let canvas, ctx;
 let chartW, chartH, histH, totalH;
 
@@ -173,11 +174,29 @@ function connectWS() {
         return;
       }
 
+      // --- MODO MANUAL: Handlers automáticos comentados ---
+      /*
+      else if (msg.type === 'clusters_closed') {
+        backendClosedClusters = Array.isArray(msg.clusters) ? msg.clusters : [];
+        if (window.LBLineManager) {
+          window.LBLineManager.monitorLines(backendClosedClusters);
+        }
+        render();
+      }
+      else if (msg.type === 'liquidity_breaks') {
+        const all = Array.isArray(msg.breaks) ? msg.breaks : [];
+        if (window.LBLineManager) {
+          window.LBLineManager.buildLinesFromBreaks(all);
+          window.LBLineManager.monitorLines(backendClosedClusters);
+        }
+        render();
+      }
+      */
+
       if (msg.type === 'connected') {
         const src = msg.data?.source || 'unknown';
         dataSource = src;
         const badge = document.getElementById('binanceStatus');
-
         if (src === 'mt5') {
           badge.style.display = 'inline-flex';
           badge.textContent = '⬤ MT5 EXNESS';
@@ -209,13 +228,11 @@ function connectWS() {
             document.getElementById('thresholdValue').textContent =
               threshold >= 1000 ? (threshold/1000)+'k' : threshold;
 
-            // stepSlider is multiplier
             const mult = Math.max(1, Math.round(priceStep / STEP_BASE));
             priceStep = mult * STEP_BASE;
             document.getElementById('stepSlider').value = mult;
             document.getElementById('stepValue').textContent = '$' + priceStep.toFixed(2);
 
-            // keep select synced
             const sel = document.getElementById('symbolSelect');
             if (sel) sel.value = sym;
           }
@@ -522,7 +539,7 @@ function render() {
     ctx.fill();
   }
 
-  // CLUSTERS
+  // ========== CLUSTERS (MAIN LOOP) ==========
   for (let idx = 0; idx < clusters.length; idx++) {
     const cluster = clusters[idx];
     const centerX = clusterToX(idx);
@@ -753,7 +770,6 @@ function render() {
       }
     }
 
-    // absorption markers triangles
     if (cluster.absorptionCount > 0) {
       const ms = Math.min(6, Math.max(3, cw * 0.3));
 
@@ -776,7 +792,6 @@ function render() {
       }
     }
 
-    // stacking bars
     if (cluster.maxStackingBuy >= 2 || cluster.maxStackingSell >= 2) {
       const barW2 = Math.max(2, cw * 0.12);
       const bTop = bodyTop;
@@ -805,25 +820,60 @@ function render() {
       ctx.arc(dotX, dotY, dotSize, 0, Math.PI * 2);
       ctx.fill();
     }
-  }
+  } // FIM DO LOOP CLUSTERS
 
-    // ========== VOLUME HISTOGRAM (DUAL BAR — VERY EVIDENT) ==========
+  // ========== MANUAL LB SELECTION MARKERS (ÚNICO LUGAR CORRETO) ==========
+  const drawSelectionBox = (clusterId, color, label) => {
+    if (clusterId == null) return;
+
+    const idx = Number(clusterId);
+    if (!isFinite(idx)) return;
+
+    const centerX = clusterToX(idx);
+    const x = centerX - clusterWidth / 2;
+    const cw = clusterWidth;
+
+    if (centerX < -cw || centerX > chartW + cw) return;
+
+    const c = clusters[idx];
+    if (!c || !c.isClosed) return;
+
+    const bodyTop = priceToY(Math.max(c.open, c.close));
+    const bodyBottom = priceToY(Math.min(c.open, c.close));
+    const bodyH = Math.max(3, bodyBottom - bodyTop);
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(x - 3, bodyTop - 3, cw + 6, bodyH + 6);
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = color;
+    ctx.font = 'bold 10px JetBrains Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, centerX, Math.max(12, bodyTop - 10));
+    ctx.restore();
+  };
+
+  drawSelectionBox(manualLB.prev?.id, '#40c4ff', 'PREV');
+  drawSelectionBox(manualLB.brk?.id,  '#ff6b35', 'BREAK');
+
+  // ========== VOLUME HISTOGRAM ==========
   if (histH > 0) {
     const histY = chartH;
     const labelH = 14;
     const gap = 4;
     const availH = histH - labelH - gap;
-    const bar1H = availH * HIST_SPLIT;        // Volume total
-    const bar2H = availH * (1 - HIST_SPLIT);  // Body/Wick split
+    const bar1H = availH * HIST_SPLIT;
+    const bar2H = availH * (1 - HIST_SPLIT);
 
-    // Background with subtle gradient
     const histGrad = ctx.createLinearGradient(0, histY, 0, histY + histH);
     histGrad.addColorStop(0, '#0f1923');
     histGrad.addColorStop(1, '#0a0e17');
     ctx.fillStyle = histGrad;
     ctx.fillRect(0, histY, chartW + PRICE_WIDTH, histH);
 
-    // Separator line (draggable — bright with highlight on hover)
     ctx.strokeStyle = crosshair.visible && Math.abs(crosshair.y - histY) < 6 ? '#667788' : '#334455';
     ctx.lineWidth = crosshair.visible && Math.abs(crosshair.y - histY) < 6 ? 3 : 2;
     ctx.beginPath();
@@ -831,7 +881,6 @@ function render() {
     ctx.lineTo(chartW + PRICE_WIDTH, histY);
     ctx.stroke();
 
-    // Middle separator (between bar1 and bar2) — draggable
     const midY = histY + labelH + bar1H + gap / 2;
     const nearMid = crosshair.visible && Math.abs(crosshair.y - midY) < 5;
     ctx.strokeStyle = nearMid ? '#8899aa' : '#1e2d3d';
@@ -841,7 +890,6 @@ function render() {
     ctx.lineTo(chartW, midY);
     ctx.stroke();
 
-    // Labels
     ctx.font = 'bold 8px JetBrains Mono';
     ctx.textAlign = 'left';
     ctx.fillStyle = CONFIG.highlight;
@@ -851,14 +899,14 @@ function render() {
 
     for (let idx = 0; idx < clusters.length; idx++) {
       const cluster = clusters[idx];
-      const centerX = viewState.offsetX + idx * (clusterWidth + CONFIG.clusterGap) + clusterWidth / 2;
+      const centerX = clusterToX(idx);
       const x = centerX - clusterWidth / 2;
       if (centerX < -clusterWidth || centerX > chartW + clusterWidth) continue;
 
       const isBull = cluster.close >= cluster.open;
       const volRatio = cluster.volumeTotal / maxVolume;
 
-      // ===== BAR 1: VOLUME TOTAL (top) =====
+      // ===== BAR 1: VOLUME TOTAL =====
       const v1H = volRatio * (bar1H - 4);
       const v1Y = histY + labelH + bar1H - v1H;
 
@@ -873,11 +921,9 @@ function render() {
       ctx.fillStyle = vGrad;
       ctx.fillRect(x + 0.5, v1Y, clusterWidth - 1, v1H);
 
-      // Bright top edge
       ctx.fillStyle = isBull ? '#b9f6ca55' : '#ffcdd255';
       ctx.fillRect(x + 0.5, v1Y, clusterWidth - 1, Math.min(2, v1H));
 
-      // Volume text on big bars
       if (volRatio > 0.3 && viewState.scaleX >= 0.8 && v1H > 10) {
         ctx.fillStyle = '#ffffffbb';
         ctx.font = '7px JetBrains Mono';
@@ -886,7 +932,7 @@ function render() {
         ctx.fillText(vText, centerX, v1Y + v1H / 2 + 3);
       }
 
-      // ===== BAR 2: BODY / WICK SPLIT (bottom) =====
+      // ===== BAR 2: BODY / WICK =====
       const v2H = volRatio * (bar2H - 4);
       const v2Y = midY + gap / 2;
 
@@ -897,26 +943,41 @@ function render() {
         const wickBarH = v2H * wickPct;
         const baseY2 = v2Y + bar2H - v2H;
 
-        // Wick part (bottom of bar)
         if (wickBarH > 0) {
           const wickColor = cluster.wickPercent >= 50 ? '#ffd740' : '#455a64';
           ctx.fillStyle = wickColor + 'cc';
           ctx.fillRect(x + 0.5, baseY2, clusterWidth - 1, wickBarH);
         }
-        // Body part (top of bar, stacked on wick)
         if (bodyBarH > 0) {
           ctx.fillStyle = isBull ? '#4caf50cc' : '#e53935cc';
           ctx.fillRect(x + 0.5, baseY2 + wickBarH, clusterWidth - 1, bodyBarH);
         }
       }
 
-      // Wick warning highlight at bottom
       if (cluster.wickPercent >= CONFIG.wickWarningThreshold) {
         ctx.fillStyle = CONFIG.highlight + 'aa';
         ctx.fillRect(x, histY + histH - 3, clusterWidth, 3);
       }
     }
   }
+}
+
+// ---------- HELPERS: CLUSTER PICKING ----------
+function getClosedClusterIndexFromCanvasX(x) {
+  const clusterWidth = Math.max(8, 40 * viewState.scaleX);
+  const step = clusterWidth + CONFIG.clusterGap;
+  const idx = Math.round((x - viewState.offsetX) / step);
+  return idx;
+}
+
+function getClosedClusterByCanvasX(x) {
+  const idx = getClosedClusterIndexFromCanvasX(x);
+  if (idx < 0 || idx >= closedClusters.length) return null;
+
+  const c = closedClusters[idx];
+  if (!c || !c.isClosed) return null;
+
+  return { idx, cluster: c };
 }
 
 /* =================== CANVAS EVENTS =================== */
@@ -990,6 +1051,26 @@ function setupCanvasEvents() {
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
+
+    // ---------- MANUAL LB PICKER (TOPO - PRIORIDADE MÁXIMA) ----------
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      const hit = getClosedClusterByCanvasX(x);
+      if (hit) {
+        const c = hit.cluster;
+        const picked = { id: c.id, poc: c.poc, endTime: c.endTime };
+
+        if (e.shiftKey) {
+          manualLB.prev = picked;
+          console.log('[LB manual] prev set:', picked);
+        } else { // Ctrl ou Cmd
+          manualLB.brk = picked;
+          console.log('[LB manual] break set:', picked);
+        }
+
+        render();
+        return; // IMPEDE QUE O CLIQUE VIRE PAN/DRAG
+      }
+    }
 
     if (Math.abs(y - chartH) < 6 && x < chartW) {
       viewState.isDragging = true;
@@ -1463,6 +1544,38 @@ function updateEnginePanel() {
   const labEl = document.getElementById('eng_signal_label');
   labEl.textContent = signal > 0 ? 'bullish' : signal < 0 ? 'bearish' : 'neutro';
 }
+
+// ---------- HANDLER TECLA L (SALVAR) ----------
+window.addEventListener('keydown', (ev) => {
+  if (ev.key.toLowerCase() !== 'l') return;
+  if (!manualLB.prev || !manualLB.brk) {
+    console.log('[LB manual] selecione prev (shift+click) e break (ctrl+click) antes de salvar');
+    return;
+  }
+
+  const item = {
+    symbol: currentSymbol,
+    price_step: priceStep,
+    delta_th: threshold,
+    prev_cluster_id: manualLB.prev.id,
+    break_cluster_id: manualLB.brk.id,
+    prev_poc: manualLB.prev.poc,
+    break_poc: manualLB.brk.poc,
+    time_prev: manualLB.prev.endTime,
+    time_break: manualLB.brk.endTime,
+    note: '',
+    created_at: Date.now(),
+  };
+
+  manualLB.items.push(item);
+  console.log('[LB manual] SAVED', item);
+
+  const blob = new Blob([JSON.stringify(manualLB.items, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `manual_liquidity_breaks_${currentSymbol}.json`;
+  a.click();
+});
 
 // ---------- START ----------
 document.addEventListener('DOMContentLoaded', init);
