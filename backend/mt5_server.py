@@ -36,6 +36,7 @@ except ImportError:
     sys.exit(1)
 
 from engine_orchestrator import VolumeEngineOrchestrator, SYMBOL_ENGINE_CONFIG
+from liquidity_break import rebuild_clusters_from_ticks, detect_liquidity_breaks
 
 # ==========================================
 # LOGGING
@@ -284,6 +285,11 @@ active_symbols = ["BTCUSD", "XAUUSD", "EURUSD", "GBPUSD", "USTEC"]
 tick_count = 0
 weight_mode = 'price_weighted'
 
+# Per-symbol visible tick cache (populated on get_history responses)
+visible_tick_cache: Dict[str, List[Dict]] = {}
+# Per-symbol cluster configs set by the frontend slider
+cluster_configs: Dict[str, Dict] = {}
+
 DEFAULT_ENGINES = ["tick_velocity", "spread_weight", "micro_cluster", "atr_normalize", "imbalance_detector"]
 
 # ==========================================
@@ -345,6 +351,8 @@ async def handle_client(ws, path=None):
                     sym = data.get('symbol', current_symbol).upper()
                     hours = data.get('hours', 24)
                     ticks = mt5_conn.get_history(sym, hours)
+                    # Cache the visible tick universe for this symbol
+                    visible_tick_cache[sym] = ticks
                     await ws.send(json.dumps({
                         'type': 'history',
                         'symbol': sym,
@@ -352,6 +360,57 @@ async def handle_client(ws, path=None):
                         'hours': hours,
                         'ticks': ticks,
                     }))
+                
+                elif action == 'set_cluster_config':
+                    sym = data.get('symbol', current_symbol).upper()
+                    delta_th = data.get('delta_th')
+                    price_step = data.get('price_step')
+
+                    # Validate types (also rejects None from missing fields)
+                    if not isinstance(delta_th, (int, float)) or not isinstance(price_step, (int, float)):
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: delta_th and price_step must be numbers',
+                        }))
+                    elif delta_th <= 0:
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: delta_th must be > 0',
+                        }))
+                    elif price_step <= 0:
+                        await ws.send(json.dumps({
+                            'type': 'error',
+                            'message': 'set_cluster_config: price_step must be > 0',
+                        }))
+                    else:
+                        cluster_configs[sym] = {'delta_th': delta_th, 'price_step': price_step}
+                        await broadcast({
+                            'type': 'cluster_config_updated',
+                            'symbol': sym,
+                            'delta_th': delta_th,
+                            'price_step': price_step,
+                        })
+                        logger.info(f"[CLUSTER] Config {sym}: delta_th={delta_th} price_step={price_step}")
+
+                        # Rebuild from cached visible ticks
+                        cached = visible_tick_cache.get(sym)
+                        if not cached:
+                            await ws.send(json.dumps({
+                                'type': 'error',
+                                'message': f'set_cluster_config: no cached ticks for {sym}; load history first',
+                            }))
+                        else:
+                            closed = rebuild_clusters_from_ticks(cached, sym, delta_th, price_step)
+                            lb_list = detect_liquidity_breaks(closed, price_step=price_step, min_steps=2)
+                            await broadcast({
+                                        'type': 'clusters_closed',
+                                        'symbol': sym,
+                                        'delta_th': delta_th,
+                                        'price_step': price_step,
+                                        'count': len(closed),
+                                        'clusters': closed,
+                })
+                            logger.info(f"[CLUSTER] {sym}: {len(closed)} clusters, {len(lb_list)} breaks")
                 
                 elif action == 'set_weight_mode':
                     mode = data.get('mode', 'price_weighted')
@@ -394,25 +453,50 @@ async def mt5_poll_loop():
             sym = current_symbol
             tick = mt5_conn.get_tick(sym)
             
-            if tick and tick.time != last_times.get(sym, 0):
-                last_times[sym] = tick.time
-                tick_count += 1
-                
-                if tick.bid > 0 and tick.ask > 0:
-                    config = gcfg(sym)
-                    mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
-                    
-                    tick_data = {
-                        'symbol': sym,
-                        'price': round(mid, config['dig']),
-                        'bid': round(tick.bid, config['dig']),
-                        'ask': round(tick.ask, config['dig']),
-                        'volume_synthetic': round(vol, 2),
-                        'side': side,
-                        'timestamp': int(time.time() * 1000),
-                        'spread': round(spread, config['dig']),
-                        'price_change': round(pc, config['dig']),
-                    }
+             # Dedup with ms precision (prevents dropping multiple ticks per second)
+            if tick:
+                tick_ts = getattr(tick, "time_msc", None)
+                if tick_ts is None:
+                    # fallback: seconds -> ms
+                    tick_ts = int(getattr(tick, "time", 0)) * 1000
+
+                if tick_ts != last_times.get(sym, 0):
+                    last_times[sym] = tick_ts
+                    tick_count += 1
+
+                    if tick.bid > 0 and tick.ask > 0:
+                        config = gcfg(sym)
+                        mid, vol, pc, side, spread = vc.calc(sym, tick.bid, tick.ask)
+
+                        tick_data = {
+                            'symbol': sym,
+                            'price': round(mid, config['dig']),
+                            'bid': round(tick.bid, config['dig']),
+                            'ask': round(tick.ask, config['dig']),
+                            'volume_synthetic': round(vol, 2),
+                            'side': side,
+                            # Use the actual MT5 tick timestamp (ms)
+                            'timestamp': int(tick_ts),
+                            'spread': round(spread, config['dig']),
+                            'price_change': round(pc, config['dig']),
+                        }
+
+                        # Run engines
+                        if orchestrator:
+                            analysis = orchestrator.analyze_tick(tick_data)
+                            tick_data['is_absorption'] = analysis.get('is_absorption', False)
+                            tick_data['absorption_type'] = analysis.get('absorption_type')
+                            tick_data['absorption_strength'] = analysis.get('absorption_strength', 0)
+                            tick_data['composite_signal'] = analysis.get('composite_signal', 0)
+                            tick_data['stacking_buy'] = analysis.get('stacking_buy', 0)
+                            tick_data['stacking_sell'] = analysis.get('stacking_sell', 0)
+                            tick_data['engines'] = analysis.get('engines', {})
+
+                        await broadcast({'type': 'tick', 'data': tick_data})
+
+                        if tick_count % 200 == 0:
+                            side_icon = '🟢' if side == 'buy' else '🔴'
+                            logger.info(f"{side_icon} #{tick_count} | {sym} {tick.bid:.{config['dig']}f}/{tick.ask:.{config['dig']}f} | vol={vol:.1f} | Δ={side}")
                     
                     # Run engines
                     if orchestrator:
@@ -498,7 +582,7 @@ async def simulation_loop():
 # ==========================================
 # HTTP SERVER (serves frontend)
 # ==========================================
-def start_http_server(port=8000):
+def start_http_server(port=8001):
     base = os.path.dirname(os.path.abspath(__file__))
     
     for candidate in [
@@ -561,10 +645,10 @@ async def main():
     http_thread.start()
     
     # Start WebSocket server
-    print(f"📡 WebSocket: ws://localhost:8765")
+    print(f"📡 WebSocket: ws://localhost:8766")
     print("=" * 60 + "\n")
     
-    server = await websockets.serve(handle_client, "localhost", 8765)
+    server = await websockets.serve(handle_client, "localhost", 8766)
     
     # Start background tasks
     mt5_task = asyncio.create_task(mt5_poll_loop())

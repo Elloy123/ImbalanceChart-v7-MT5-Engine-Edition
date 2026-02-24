@@ -1,0 +1,15 @@
+[
+  {
+    "symbol": "XAUUSD",
+    "price_step": 0.5,
+    "delta_th": 100,
+    "prev_cluster_id": 1900,
+    "break_cluster_id": 1902,
+    "prev_poc": 5143.5,
+    "break_poc": 5144.5,
+    "time_prev": 1771949493760,
+    "time_break": 1771949545209,
+    "note": "",
+    "created_at": 1771949968325
+  }
+]
